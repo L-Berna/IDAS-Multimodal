@@ -17,6 +17,7 @@ import tempfile
 import pydub
 from pydub import playback
 import logging
+from functools import lru_cache
 
 # Modelos y cadenas de LLM y embeddings
 from transformers import BridgeTowerProcessor, BridgeTowerForContrastiveLearning
@@ -44,7 +45,7 @@ if not ELEVEN_API_KEY:
     raise ValueError("Debes establecer la variable de entorno ELEVEN_LABS_KEY con tu clave de ElevenLabs.")
 
 # Rutas y configuraciones para bases de datos y modelos
-LANCEDB_PATH = r'C:\Users\krato\Documents\Documentos Uni\3° Semestre\Proyecto\LanceDB_New'
+LANCEDB_PATH = r'LanceDB_OPENAI'
 VECTOR_DB_DIR = 'vector_database_chspark_1536'
 LLM_MODEL = "gpt-4o-mini"  # Modelo del LLM para re-ranking y QA
 
@@ -78,10 +79,12 @@ class RetrievalManager:
         self.vector_db_dir = vector_db_dir
         self.llm_model = llm_model
         self.openai_api_key = openai_api_key
+        self.embedding_cache = {}
         self._connect_db()
         self._build_ann_index()
         self._initialize_retrieval_qa()
         self._initialize_bridgetower()
+        self._preload_models()
 
     def _connect_db(self):
         """Conecta a la base de datos LanceDB y abre la tabla de embeddings."""
@@ -93,13 +96,18 @@ class RetrievalManager:
             raise
 
     def _build_ann_index(self):
-        """Construye el índice FAISS a partir de los embeddings de la base de datos."""
+        """Construye el índice FAISS optimizado para búsqueda rápida."""
         data = self.table.to_pandas()
-        if 'vector' not in data.columns:
-            raise ValueError("La tabla no contiene la columna 'vector'.")
         embeddings = np.array(data['vector'].tolist(), dtype='float32')
         d = embeddings.shape[1]
-        self.index_ann = faiss.IndexHNSWFlat(d, 32)
+        
+        # Usar IndexHNSWFlat con parámetros optimizados
+        self.index_ann = faiss.IndexHNSWFlat(d, 64)  # Aumentar M a 64 para mejor precisión
+        self.index_ann.hnsw.efConstruction = 200  # Aumentar para mejor construcción
+        self.index_ann.hnsw.efSearch = 100  # Aumentar para mejor búsqueda
+        
+        # Normalizar vectores antes de añadirlos
+        faiss.normalize_L2(embeddings)
         self.index_ann.add(embeddings)
         logger.info("Índice FAISS construido con %d vectores.", self.index_ann.ntotal)
         self.rows_data = data.to_dict('records')
@@ -109,11 +117,14 @@ class RetrievalManager:
         embedding_model = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=self.openai_api_key)
         vectordb = Chroma(embedding_function=embedding_model, persist_directory=self.vector_db_dir)
         template = (
-            "You are IDAS a virtual assistant specialized in vehicle but you can also answer questions that are not related to vehicles or the manual.\n"
-            "Provide assistance using the vehicle manual to answer questions if the question is related to vehicles or the manual. If not answer based on the knowledge you have.\n"
-            "Provide an answer that is as concise as possible without losing essential context. Be direct and to the point – remember, you are speaking to a car driver who only needs the necessary information, not an overload of details.\n\n"
-            "Manual Context:\n{context}\n\n"
-            "Question:\n{question}\n\n"
+            "You are IDAS, a vehicle expert assistant. Follow these rules:\n"
+            "1. MAX 3 bullet points\n"
+            "2. MAX 15 words per point\n"
+            "3. Technical terms only\n"
+            "4. No explanations\n"
+            "5. Actionable steps\n\n"
+            "Context: {context}\n"
+            "Question: {question}\n"
             "Answer:\n"
         )
         qa_chain_prompt = PromptTemplate.from_template(template)
@@ -126,12 +137,17 @@ class RetrievalManager:
 
     def _initialize_bridgetower(self):
         """Carga el modelo BridgeTower y su procesador para generar embeddings multimodales."""
-        self.processor = BridgeTowerProcessor.from_pretrained("BridgeTower/bridgetower-large-itm-mlm-itc")
+        self.processor = BridgeTowerProcessor.from_pretrained(
+            "BridgeTower/bridgetower-large-itm-mlm-itc",
+            cache_dir="./model_cache"
+        )
         self.model_bridgetower = BridgeTowerForContrastiveLearning.from_pretrained(
-            "BridgeTower/bridgetower-large-itm-mlm-itc"
+            "BridgeTower/bridgetower-large-itm-mlm-itc",
+            cache_dir="./model_cache"
         ).to(self.device)
         self.model_bridgetower.eval()
 
+    @lru_cache(maxsize=1000)
     def generate_query_embedding(self, query_text):
         """
         Genera un embedding combinado (texto e imagen) para una consulta.
@@ -242,9 +258,14 @@ Responde únicamente con "SI" si está relacionada con vehículos o "NO" si no l
         model_response = self.qa_chain({"query": query_text})
         manual_context = model_response.get("result", "No se encontró contexto relevante.")
         final_prompt = f"""
-You are a vehicle expert virtual assistant. Below you have an image description and a vehicle manual extract.
-Your task is to integrate both pieces of information to answer the query accurately, concisely, and technically. If there is no image description, just
-answer what the driver ask you.
+You are a vehicle expert virtual assistant. Your responses must be extremely concise and structured.
+
+IMPORTANT GUIDELINES:
+1. Use bullet points or numbered lists
+2. Keep each point to 1-2 sentences maximum
+3. Focus only on essential information
+4. Avoid unnecessary explanations
+5. Be direct and actionable
 
 Image Description:
 {image_caption}
@@ -255,11 +276,23 @@ Manual Extract:
 Query:
 {query_text}
 
-Respond in a detailed and technical manner.
+Provide a structured, concise response following the guidelines above.
 """
         response_generated = ChatOpenAI(openai_api_key=self.openai_api_key, temperature=0, model_name=self.llm_model)(final_prompt)
         response_text = response_generated.content if hasattr(response_generated, 'content') else str(response_generated)
         return best_result, response_text
+
+    def _preload_models(self):
+        """Precarga modelos para reducir latencia."""
+        self.processor = BridgeTowerProcessor.from_pretrained(
+            "BridgeTower/bridgetower-large-itm-mlm-itc",
+            cache_dir="./model_cache"
+        )
+        self.model_bridgetower = BridgeTowerForContrastiveLearning.from_pretrained(
+            "BridgeTower/bridgetower-large-itm-mlm-itc",
+            cache_dir="./model_cache"
+        ).to(self.device)
+        self.model_bridgetower.eval()
 
 ###############################################################################
 # MÓDULO: VoiceManager
@@ -530,7 +563,7 @@ class VehicleAssistantUI:
         Inicia el proceso de grabación y actualiza la interfaz para reflejar el estado de escucha.
         """
         self.state = "listening"
-        self.btn_listening.config(text="Stop Listening", bg="lightcoral")
+        self.btn_listening.configure(text="Stop\nListening")
         self.voice_manager.start_recording(self.temp_audio_file)
         self.append_history("Sistema: Escuchando...")
 
@@ -539,7 +572,7 @@ class VehicleAssistantUI:
         Detiene la grabación y lanza en un hilo separado el procesamiento de la consulta de voz.
         """
         self.state = "processing"
-        self.btn_listening.config(text="Processing...", bg="#a3a300")
+        self.btn_listening.configure(text="Processing...")
         self.voice_manager.stop_recording()
         threading.Thread(target=self.process_voice_query, args=(self.temp_audio_file,), daemon=True).start()
 
@@ -579,7 +612,7 @@ class VehicleAssistantUI:
         except Exception as e:
             self.append_history(f"Error: {e}")
         finally:
-            self.btn_listening.config(text="Start Listening", bg="#3f704d")
+            self.btn_listening.configure(text="Start\nListening")
             self.state = "waiting"
             # Elimina el archivo de audio temporal
             try:
@@ -622,12 +655,24 @@ class VehicleAssistantUI:
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=20)
 
-        btn_new = tk.Button(btn_frame, text="New Chat", font=("Verdana", 32), height=4, width=6,
-                            bg="#406ce5", fg="black", command=self.new_session)
+        # Configurar estilo para los botones
+        style = ttk.Style()
+        style.configure('Custom.TButton', 
+                       font=('Verdana', 32),
+                       padding=10)
+
+        # Botón New Chat con texto ajustado
+        btn_new = ttk.Button(btn_frame, 
+                            text="New\nChat", 
+                            style='Custom.TButton',
+                            command=self.new_session)
         btn_new.pack(side=tk.LEFT, padx=20)
 
-        self.btn_listening = tk.Button(btn_frame, text="Start Listening", font=("Verdana", 48),
-                                       height=3, width=20, bg="#3f704d", fg="black", command=self.toggle_listening)
+        # Botón Start Listening con texto ajustado
+        self.btn_listening = ttk.Button(btn_frame, 
+                                      text="Start\nListening", 
+                                      style='Custom.TButton',
+                                      command=self.toggle_listening)
         self.btn_listening.pack(side=tk.LEFT, padx=20)
 
         # Label para mostrar imágenes (resultado)
@@ -637,7 +682,11 @@ class VehicleAssistantUI:
         # Área de texto para mostrar el historial de conversación
         text_frame = tk.Frame(self.root)
         text_frame.pack(pady=20)
-        self.text_box = tk.Text(text_frame, font=("Verdana", 16), height=15, width=80, wrap="word")
+        self.text_box = tk.Text(text_frame, 
+                               font=("Verdana", 16), 
+                               height=15, 
+                               width=80, 
+                               wrap="word")
         self.text_box.pack(side=tk.LEFT)
         scrollbar = tk.Scrollbar(text_frame, command=self.text_box.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
