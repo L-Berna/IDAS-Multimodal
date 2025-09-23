@@ -7,17 +7,43 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import lancedb
-import faiss
+# Usaremos la búsqueda nativa de LanceDB en lugar de FAISS
 import threading
 import wave
 import pyaudio
-import asyncio
 import requests
 import tempfile
 import pydub
 from pydub import playback
 import logging
 from functools import lru_cache
+try:
+    # tqdm es opcional; se usa para mostrar barras de progreso y ETA
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+# New imports for improvements
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+import string
+import difflib
+from textblob import TextBlob
+import librosa
+from scipy.signal import wiener
+import webrtcvad
+from collections import deque
+import json
+
+# Download required NLTK data
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.download('wordnet', quiet=True)
+except:
+    pass
 
 # Modelos y cadenas de LLM y embeddings
 from transformers import BridgeTowerProcessor, BridgeTowerForContrastiveLearning
@@ -29,7 +55,6 @@ from langchain.vectorstores import Chroma
 # Clientes para voz: Whisper y ElevenLabs
 import openai  # Se usará para Whisper (speech-to-text)
 from elevenlabs.client import ElevenLabs
-from elevenlabs import stream
 
 # Configuración de logging para registrar información y errores
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,8 +70,9 @@ if not ELEVEN_API_KEY:
     raise ValueError("Debes establecer la variable de entorno ELEVEN_LABS_KEY con tu clave de ElevenLabs.")
 
 # Rutas y configuraciones para bases de datos y modelos
-LANCEDB_PATH = r'LanceDB_OPENAI'
-VECTOR_DB_DIR = 'vector_database_chspark_1536'
+# Ruta a la base generada por el nuevo SimpleEmbeddings (image_vector/text_vector)
+LANCEDB_PATH = r'C:\Users\krato\Documents\Documentos Uni\4° Semestre\Proyecto\Fase2-MMRAG\LanceDB_KIA-Simple_Mejorado'
+VECTOR_DB_DIR = r'C:\Users\krato\Documents\Documentos Uni\4° Semestre\Proyecto\Fase1-RAG\vector_database_kia_sorento_3072'
 LLM_MODEL = "gpt-4o-mini"  # Modelo del LLM para re-ranking y QA
 
 # Parámetros de audio
@@ -61,14 +87,385 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info("Usando dispositivo: %s", device)
 
 ###############################################################################
+# MÓDULO: QueryProcessor
+###############################################################################
+class QueryProcessor:
+    """
+    Clase encargada de procesar, mejorar y validar las consultas del usuario
+    antes de enviarlas al sistema de recuperación.
+    """
+    def __init__(self):
+        """
+        Inicializa el procesador de consultas con diccionarios y herramientas de NLP.
+        """
+        self.lemmatizer = WordNetLemmatizer()
+        self.stop_words = set(stopwords.words('spanish') + stopwords.words('english'))
+        self.conversation_context = deque(maxlen=5)  # Últimas 5 interacciones
+        
+        # Diccionario de corrección para términos automotrices
+        self.automotive_corrections = {
+            "frenos": ["freno", "break", "breik"],
+            "motor": ["motos", "moto", "engin"],
+            "aceite": ["aseit", "oil", "oyl"],
+            "batería": ["bateria", "battery", "bateri"],
+            "transmisión": ["transmision", "transmission", "transmishon"],
+            "embrague": ["embrage", "clutch", "cloch"],
+            "radiador": ["radiadors", "radiator", "rediator"],
+            "filtro": ["filter", "filtros"],
+            "bujías": ["bujias", "spark plugs", "spark plug"],
+            "alternador": ["alternadors", "alternator"],
+            "arranque": ["starter", "estarter"],
+            "dirección": ["direccion", "steering", "stiring"],
+            "suspensión": ["suspension", "shocks", "shock"],
+            "neumáticos": ["neumaticos", "llantas", "tires", "tire"],
+            "escape": ["exhaust", "exost"],
+            "turbo": ["turbo", "turbos"],
+            "diésel": ["diesel", "disel"],
+            "gasolina": ["gasolin", "gas", "fuel"],
+            "refrigerante": ["coolant", "colant"],
+            "válvulas": ["valvulas", "valves", "valve"]
+        }
+        
+        # Sinónimos para expansión de consultas
+        self.automotive_synonyms = {
+            "problema": ["falla", "error", "avería", "defecto", "mal funcionamiento"],
+            "ruido": ["sonido", "sonidos", "ruidos", "noise"],
+            "temperatura": ["calor", "calentamiento", "sobrecalentamiento"],
+            "vibración": ["vibraciones", "temblor", "shake"],
+            "pérdida": ["fuga", "goteo", "derrame"],
+            "cambio": ["reemplazo", "sustitución", "reemplazar"],
+            "revisar": ["verificar", "chequear", "inspeccionar", "examinar"],
+            "reparar": ["arreglar", "componer", "fix"]
+        }
+        
+        # Tipos de consulta para clasificación
+        self.query_types = {
+            "diagnostic": ["problema", "falla", "error", "ruido", "vibración", "síntoma"],
+            "maintenance": ["cambio", "reemplazo", "mantenimiento", "revisar", "inspección"],
+            "procedure": ["cómo", "procedimiento", "pasos", "instrucciones", "manual"],
+            "specification": ["especificación", "medida", "capacidad", "torque", "presión"]
+        }
+
+        # Términos del dominio automotriz (para evitar falsos positivos de "consulta incompleta")
+        domain_terms = set()
+        for key, variants in self.automotive_corrections.items():
+            domain_terms.add(key)
+            domain_terms.update(variants)
+        for key, variants in self.automotive_synonyms.items():
+            domain_terms.add(key)
+            domain_terms.update(variants)
+        # Ampliación manual frecuente
+        domain_terms.update({
+            "llanta", "llantas", "neumático", "neumáticos", "rueda", "ruedas",
+            "repuesto", "refacción", "refacciones", "gato", "maletero", "herramienta",
+            "herramientas", "cruceta", "tuerca", "tuercas", "tornillo", "tornillos",
+            "faro", "focos", "fusible", "fusibles", "manual", "kit", "compresor"
+        })
+        self.domain_terms = {t.lower() for t in domain_terms}
+
+    def detect_voice_activity(self, audio_data, sample_rate=16000):
+        """
+        Detecta si hay actividad de voz en el audio usando WebRTC VAD.
+        
+        Args:
+            audio_data (bytes): Datos de audio.
+            sample_rate (int): Frecuencia de muestreo.
+        
+        Returns:
+            bool: True si se detecta voz, False en caso contrario.
+        """
+        try:
+            vad = webrtcvad.Vad(2)  # Agresividad media
+            # Convertir a formato requerido por VAD
+            frame_duration = 30  # ms
+            frame_size = int(sample_rate * frame_duration / 1000)
+            
+            # Procesar en chunks
+            voice_frames = 0
+            total_frames = 0
+            
+            for i in range(0, len(audio_data), frame_size * 2):  # *2 para 16-bit
+                frame = audio_data[i:i + frame_size * 2]
+                if len(frame) == frame_size * 2:
+                    total_frames += 1
+                    if vad.is_speech(frame, sample_rate):
+                        voice_frames += 1
+            
+            if total_frames == 0:
+                return False
+                
+            voice_ratio = voice_frames / total_frames
+            return voice_ratio > 0.3  # Al menos 30% debe ser voz
+            
+        except Exception as e:
+            logger.warning("Error en detección de voz: %s", e)
+            return True  # Asumimos que hay voz si hay error
+
+    def improve_audio_quality(self, audio_file_path):
+        """
+        Mejora la calidad del audio aplicando filtros de ruido.
+        
+        Args:
+            audio_file_path (str): Ruta del archivo de audio.
+        
+        Returns:
+            str: Ruta del archivo mejorado.
+        """
+        try:
+            # Cargar audio
+            audio, sr = librosa.load(audio_file_path, sr=16000)
+            
+            # Aplicar filtro Wiener para reducir ruido
+            filtered_audio = wiener(audio, noise=0.01)
+            
+            # Normalizar audio
+            filtered_audio = librosa.util.normalize(filtered_audio)
+            
+            # Guardar audio mejorado
+            improved_path = audio_file_path.replace('.wav', '_improved.wav')
+            import soundfile as sf
+            sf.write(improved_path, filtered_audio, sr)
+            
+            return improved_path
+            
+        except Exception as e:
+            logger.warning("Error mejorando audio: %s", e)
+            return audio_file_path
+
+    def clean_transcribed_text(self, text):
+        """
+        Limpia el texto transcrito eliminando muletillas y normalizando.
+        
+        Args:
+            text (str): Texto transcrito.
+        
+        Returns:
+            str: Texto limpio.
+        """
+        # Convertir a minúsculas
+        text = text.lower().strip()
+        
+        # Eliminar muletillas comunes en español
+        muletillas = ["eh", "este", "esto", "bueno", "entonces", "o sea", "digamos", 
+                     "como que", "verdad", "¿no?", "mmm", "ahh", "uhh"]
+        
+        for muletilla in muletillas:
+            text = re.sub(r'\b' + re.escape(muletilla) + r'\b', '', text, flags=re.IGNORECASE)
+        
+        # Limpiar espacios múltiples
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Eliminar signos de puntuación innecesarios al final
+        text = text.rstrip('.,!?;:')
+        
+        return text
+
+    def correct_automotive_terms(self, text):
+        """
+        Corrige errores comunes en términos automotrices.
+        
+        Args:
+            text (str): Texto a corregir.
+        
+        Returns:
+            str: Texto con términos corregidos.
+        """
+        words = text.split()
+        corrected_words = []
+        
+        for word in words:
+            best_match = word
+            best_ratio = 0.8  # Umbral mínimo de similitud
+            
+            # Buscar correcciones en el diccionario automotriz
+            for correct_term, variations in self.automotive_corrections.items():
+                for variation in variations:
+                    ratio = difflib.SequenceMatcher(None, word.lower(), variation.lower()).ratio()
+                    if ratio > best_ratio:
+                        best_match = correct_term
+                        best_ratio = ratio
+            
+            corrected_words.append(best_match)
+        
+        return ' '.join(corrected_words)
+
+    def expand_query_with_synonyms(self, text):
+        """
+        Expande la consulta añadiendo sinónimos relevantes.
+        
+        Args:
+            text (str): Consulta original.
+        
+        Returns:
+            str: Consulta expandida con sinónimos.
+        """
+        words = word_tokenize(text, language='spanish')
+        expanded_terms = []
+        
+        for word in words:
+            word_lower = word.lower()
+            expanded_terms.append(word)
+            
+            # Buscar sinónimos
+            for key, synonyms in self.automotive_synonyms.items():
+                if word_lower == key:
+                    expanded_terms.extend(synonyms[:2])  # Máximo 2 sinónimos
+                    break
+        
+        return ' '.join(expanded_terms)
+
+    def add_conversation_context(self, current_query):
+        """
+        Añade contexto de la conversación anterior a la consulta actual.
+        
+        Args:
+            current_query (str): Consulta actual.
+        
+        Returns:
+            str: Consulta con contexto añadido.
+        """
+        # Detectar referencias a respuestas anteriores
+        references = ["eso", "esto", "lo anterior", "la anterior", "ese", "esa", "el mismo", "la misma"]
+        
+        has_reference = any(ref in current_query.lower() for ref in references)
+        
+        if has_reference and len(self.conversation_context) > 0:
+            # Obtener el último tema mencionado
+            last_context = self.conversation_context[-1]
+            contextual_query = f"En relación a {last_context}, {current_query}"
+            return contextual_query
+        
+        return current_query
+
+    def classify_query_type(self, text):
+        """
+        Clasifica el tipo de consulta para optimizar la búsqueda.
+        
+        Args:
+            text (str): Consulta del usuario.
+        
+        Returns:
+            str: Tipo de consulta clasificada.
+        """
+        text_lower = text.lower()
+        scores = {}
+        
+        for query_type, keywords in self.query_types.items():
+            score = sum(1 for keyword in keywords if keyword in text_lower)
+            scores[query_type] = score
+        
+        # Retornar el tipo con mayor puntuación
+        if max(scores.values()) > 0:
+            return max(scores, key=scores.get)
+        
+        return "general"
+
+    def detect_ambiguous_query(self, text):
+        """
+        Detecta si una consulta es demasiado ambigua o incompleta.
+        
+        Args:
+            text (str): Consulta del usuario.
+        
+        Returns:
+            tuple: (es_ambigua, sugerencia_clarificación)
+        """
+        # Criterios para detectar ambigüedad
+        text_lower = text.lower()
+        tokens = text_lower.split()
+        word_count = len(tokens)
+
+        # Si contiene términos automotrices claros, no la marcamos como ambigua
+        domain_hits = any(term in text_lower for term in self.domain_terms)
+
+        # Consulta muy corta: permitimos consultas de 2-3 palabras si hay términos del dominio
+        if word_count < 3 and not domain_hits:
+            return True, "Tu consulta es muy breve. ¿Podrías proporcionar más detalles sobre el problema o procedimiento?"
+
+        # Consultas muy generales
+        general_terms = ["carro", "auto", "vehículo", "vehiculo", "problema", "ayuda"]
+        if any(term in text_lower for term in general_terms) and word_count < 5 and not domain_hits:
+            return True, "Tu consulta es muy general. ¿Podrías especificar qué parte del vehículo o qué tipo de problema específico?"
+
+        # Falta de verbos (indicativo de consulta incompleta): aplicar solo si no hay términos del dominio
+        if not domain_hits:
+            try:
+                blob = TextBlob(text)
+                verbs = [word for word, pos in blob.tags if pos.startswith('VB')]
+            except Exception:
+                verbs = []
+            # Más permisivo: exigir > 3 palabras para marcar como incompleta por falta de verbo
+            if len(verbs) == 0 and word_count > 3:
+                return True, "Tu consulta parece incompleta. ¿Qué necesitas hacer o qué está ocurriendo con tu vehículo?"
+
+        return False, ""
+
+    def process_query(self, raw_query, conversation_history=None):
+        """
+        Procesa completamente una consulta aplicando todas las mejoras.
+        
+        Args:
+            raw_query (str): Consulta sin procesar.
+            conversation_history (list): Historial de conversación.
+        
+        Returns:
+            dict: Diccionario con la consulta procesada y metadatos.
+        """
+        # Paso 1: Limpiar texto transcrito
+        cleaned_query = self.clean_transcribed_text(raw_query)
+        
+        # Paso 2: Corregir términos automotrices
+        corrected_query = self.correct_automotive_terms(cleaned_query)
+        
+        # Paso 3: Detectar ambigüedad
+        is_ambiguous, clarification = self.detect_ambiguous_query(corrected_query)
+        
+        if is_ambiguous:
+            return {
+                "processed_query": corrected_query,
+                "original_query": raw_query,
+                "is_ambiguous": True,
+                "clarification_needed": clarification,
+                "query_type": "ambiguous"
+            }
+        
+        # Paso 4: Añadir contexto de conversación
+        contextual_query = self.add_conversation_context(corrected_query)
+        
+        # Paso 5: Expandir con sinónimos
+        expanded_query = self.expand_query_with_synonyms(contextual_query)
+        
+        # Paso 6: Clasificar tipo de consulta
+        query_type = self.classify_query_type(expanded_query)
+        
+        # Actualizar contexto de conversación
+        self.conversation_context.append(corrected_query)
+        
+        return {
+            "processed_query": expanded_query,
+            "original_query": raw_query,
+            "cleaned_query": cleaned_query,
+            "corrected_query": corrected_query,
+            "contextual_query": contextual_query,
+            "is_ambiguous": False,
+            "query_type": query_type,
+            "processing_steps": {
+                "cleaned": cleaned_query != raw_query,
+                "corrected": corrected_query != cleaned_query,
+                "contextualized": contextual_query != corrected_query,
+                "expanded": expanded_query != contextual_query
+            }
+        }
+
+###############################################################################
 # MÓDULO: RetrievalManager
 ###############################################################################
 class RetrievalManager:
     """
     Clase encargada de gestionar la recuperación de información utilizando:
-      - Conexión a la base de datos y construcción del índice FAISS.
-      - Inicialización de RetrievalQA para extraer contexto del manual.
-      - Generación y re-ranking de embeddings multimodales usando BridgeTower.
+      - Conexión a la base de datos LanceDB y creación/verificación de su índice nativo.
+      - Inicialización de RetrievalQA (Chroma + LLM) para extraer contexto del manual.
+      - Generación de embeddings de texto con BridgeTower y re-ranking mejorado.
     """
     def __init__(self, device, db_path, vector_db_dir, llm_model, openai_api_key):
         """
@@ -80,11 +477,15 @@ class RetrievalManager:
         self.llm_model = llm_model
         self.openai_api_key = openai_api_key
         self.embedding_cache = {}
+        
+        # Inicializar el procesador de consultas
+        self.query_processor = QueryProcessor()
+        
         self._connect_db()
-        self._build_ann_index()
-        self._initialize_retrieval_qa()
         self._initialize_bridgetower()
-        self._preload_models()
+        self._initialize_retrieval_qa()
+        # Crear índice nativo en LanceDB para image_vector (búsqueda texto→imagen)
+        self._ensure_lancedb_index()
 
     def _connect_db(self):
         """Conecta a la base de datos LanceDB y abre la tabla de embeddings."""
@@ -95,41 +496,45 @@ class RetrievalManager:
             logger.error("Error al conectar con la base de datos: %s", e)
             raise
 
-    def _build_ann_index(self):
-        """Construye el índice FAISS optimizado para búsqueda rápida."""
-        data = self.table.to_pandas()
-        embeddings = np.array(data['vector'].tolist(), dtype='float32')
-        d = embeddings.shape[1]
-        
-        # Usar IndexHNSWFlat con parámetros optimizados
-        self.index_ann = faiss.IndexHNSWFlat(d, 64)  # Aumentar M a 64 para mejor precisión
-        self.index_ann.hnsw.efConstruction = 200  # Aumentar para mejor construcción
-        self.index_ann.hnsw.efSearch = 100  # Aumentar para mejor búsqueda
-        
-        # Normalizar vectores antes de añadirlos
-        faiss.normalize_L2(embeddings)
-        self.index_ann.add(embeddings)
-        logger.info("Índice FAISS construido con %d vectores.", self.index_ann.ntotal)
-        self.rows_data = data.to_dict('records')
+    def _ensure_lancedb_index(self):
+        """
+        Asegura un índice nativo en LanceDB sobre la columna image_vector con métrica coseno.
+        Esto permite búsquedas texto→imagen eficientes sin construir FAISS manualmente.
+        """
+        try:
+            logger.info("Creando/verificando índice nativo en LanceDB (image_vector)...")
+            # type puede ser ivf_pq o hnsw; ivf_pq es un buen balance para escala media
+            self.table.create_index(
+                column="image_vector",
+                metric="cosine",
+                type="ivf_pq",
+                num_partitions=256,
+                num_sub_vectors=64
+            )
+            logger.info("Índice LanceDB listo.")
+        except Exception as e:
+            logger.warning("No se pudo crear/verificar índice LanceDB: %s", e)
 
     def _initialize_retrieval_qa(self):
         """Inicializa el módulo RetrievalQA utilizando Chroma y un LLM para obtener contexto del manual."""
+        # Reutilizamos un cliente LLM único para todo el flujo
+        self.llm = ChatOpenAI(openai_api_key=self.openai_api_key, temperature=0, model_name=self.llm_model)
         embedding_model = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=self.openai_api_key)
         vectordb = Chroma(embedding_function=embedding_model, persist_directory=self.vector_db_dir)
         template = (
-            "You are IDAS, a vehicle expert assistant. Follow these rules:\n"
-            "1. MAX 3 bullet points\n"
-            "2. MAX 15 words per point\n"
-            "3. Technical terms only\n"
-            "4. No explanations\n"
-            "5. Actionable steps\n\n"
-            "Context: {context}\n"
-            "Question: {question}\n"
-            "Answer:\n"
+            "Eres IDAS, un asistente vehicular atento y amigable. Responde con precisión y sin rodeos. Sigue estas reglas:\n"
+            "1. Máximo 3 puntos o 3 oraciones.\n"
+            "2. Usa términos técnicos del manual cuando corresponda.\n"
+            "3. Prioriza solo lo relevante a la pregunta.\n"
+            "4. Incluye advertencias de seguridad solo si aplican.\n"
+            "5. Sé claro y conciso.\n\n"
+            "Contexto: {context}\n"
+            "Pregunta: {question}\n"
+            "Respuesta:\n"
         )
         qa_chain_prompt = PromptTemplate.from_template(template)
         self.qa_chain = RetrievalQA.from_chain_type(
-            llm=ChatOpenAI(openai_api_key=self.openai_api_key, temperature=0, model_name=self.llm_model),
+            llm=self.llm,
             retriever=vectordb.as_retriever(),
             return_source_documents=True,
             chain_type_kwargs={"prompt": qa_chain_prompt}
@@ -137,6 +542,7 @@ class RetrievalManager:
 
     def _initialize_bridgetower(self):
         """Carga el modelo BridgeTower y su procesador para generar embeddings multimodales."""
+        # Cargar BridgeTower una sola vez para generar embeddings de texto de consulta
         self.processor = BridgeTowerProcessor.from_pretrained(
             "BridgeTower/bridgetower-large-itm-mlm-itc",
             cache_dir="./model_cache"
@@ -150,15 +556,17 @@ class RetrievalManager:
     @lru_cache(maxsize=1000)
     def generate_query_embedding(self, query_text):
         """
-        Genera un embedding combinado (texto e imagen) para una consulta.
+        Genera embedding SOLO de TEXTO para la consulta, normalizado (L2).
+        La comparación se realiza contra image_vector almacenado en LanceDB.
         
         Args:
             query_text (str): El texto de la consulta.
         
         Returns:
-            list: Embedding combinado normalizado.
+            list: Embedding de texto normalizado.
         """
-        dummy_image = Image.new('RGB', (224, 224), color=(0, 0, 0))
+        # BridgeTower requiere imagen y texto; usamos una imagen mínima de relleno
+        dummy_image = Image.new('RGB', (224, 224), color=(255, 255, 255))
         encoding = self.processor(
             images=dummy_image,
             text=query_text,
@@ -167,39 +575,11 @@ class RetrievalManager:
         ).to(self.device)
         with torch.no_grad():
             outputs = self.model_bridgetower(**encoding)
-            image_embeds = torch.nn.functional.normalize(outputs.image_embeds, p=2, dim=1)
             text_embeds = torch.nn.functional.normalize(outputs.text_embeds, p=2, dim=1)
-            combined_embeds = 0.7 * text_embeds + 0.3 * image_embeds
-            combined_embeds = torch.nn.functional.normalize(combined_embeds, p=2, dim=1)
-        return combined_embeds.cpu().numpy().flatten().astype('float32').tolist()
+        return text_embeds.cpu().numpy().flatten().astype('float32').tolist()
 
-    def re_rank_candidates(self, query, candidates):
-        """
-        Utiliza un LLM para reordenar las candidaturas y determinar la que mejor responde a la consulta.
-        
-        Args:
-            query (str): La consulta del usuario.
-            candidates (list): Lista de candidatos con 'caption' y otros datos.
-        
-        Returns:
-            int: El índice del candidato seleccionado.
-        """
-        prompt = f'Given the following query:\n"{query}"\n\nAnd considering these results:\n'
-        for i, cand in enumerate(candidates, start=1):
-            prompt += f"{i}. {cand['caption']}\n"
-        prompt += "\nChoose the number of the result that best answers the query. Respond with just the number."
-        response = ChatOpenAI(openai_api_key=self.openai_api_key, temperature=0, model_name=self.llm_model)(prompt)
-        response_text = response.content.strip() if hasattr(response, 'content') else str(response).strip()
-        match = re.search(r'\d+', response_text)
-        if match:
-            try:
-                best_number = int(match.group())
-                if 1 <= best_number <= len(candidates):
-                    return best_number - 1
-            except Exception as e:
-                logger.error("Error al convertir la respuesta: %s", e)
-        logger.warning("Respuesta inesperada en re-ranking: %s", response_text)
-        return 0
+    # Nota: El re-ranking básico se conserva solo como respaldo en la copia del script.
+    # En el flujo principal se utiliza el re-ranking mejorado (avanzado).
 
     def is_vehicle_related(self, query_text):
         """
@@ -219,7 +599,7 @@ Consulta: "{query_text}"
 
 Responde únicamente con "SI" si está relacionada con vehículos o "NO" si no lo está.
 """
-        response = ChatOpenAI(openai_api_key=self.openai_api_key, temperature=0, model_name=self.llm_model)(prompt)
+        response = self.llm(prompt)
         response_text = response.content if hasattr(response, 'content') else str(response).strip()
         return "SI" in response_text.upper()
 
@@ -233,66 +613,244 @@ Responde únicamente con "SI" si está relacionada con vehículos o "NO" si no l
             top_k (int): Número de candidatos a recuperar.
         
         Returns:
-            tuple: (mejor resultado candidato, respuesta generada en texto)
+            tuple: (mejor resultado candidato, respuesta generada en texto, información de procesamiento)
         """
-        query_embedding = self.generate_query_embedding(query_text)
-        query_vector = np.array(query_embedding, dtype='float32').reshape(1, -1)
-        distances, indices = self.index_ann.search(query_vector, top_k)
+        # Procesar la consulta con todas las mejoras
+        processed_result = self.query_processor.process_query(query_text)
+        
+        # Verificar si la consulta es ambigua
+        if processed_result["is_ambiguous"]:
+            return None, processed_result["clarification_needed"], processed_result
+        
+        # Usar la consulta procesada para la búsqueda
+        final_query = processed_result["processed_query"]
+        query_type = processed_result["query_type"]
+        
+        logger.info("Consulta original: %s", query_text)
+        logger.info("Consulta procesada: %s", final_query)
+        logger.info("Tipo de consulta: %s", query_type)
+        
+        # Generar embedding de la consulta procesada (texto)
+        query_embedding = self.generate_query_embedding(final_query)
+        query_vector = np.array(query_embedding, dtype='float32')  # (d,)
+        
+        # Ajustar top_k según el tipo de consulta
+        adjusted_top_k = top_k
+        if query_type == "diagnostic":
+            adjusted_top_k = min(top_k + 3, 10)  # Más candidatos para diagnósticos
+        elif query_type == "procedure":
+            adjusted_top_k = min(top_k + 2, 8)   # Más candidatos para procedimientos
+        
+        # Búsqueda nativa LanceDB sobre image_vector con métrica coseno
+        logger.info("Buscando top-%d candidatos en LanceDB...", adjusted_top_k)
+        results_df = self.table.search(query_vector.tolist(), vector_column_name="image_vector") \
+            .metric("cosine").limit(adjusted_top_k).to_pandas()
+        
         candidates = []
-        for i in range(top_k):
-            if indices[0, i] == -1:
-                continue
-            row = self.rows_data[indices[0, i]]
-            candidates.append({
-                "imagen": row["imagen"],
-                "caption": row["texto"],
-                "score": distances[0, i]
-            })
+        if results_df is not None and len(results_df) > 0:
+            # Re-ranking híbrido: combina similitud con image_vector y text_vector
+            logger.info("Aplicando re-ranking híbrido (imagen/texto)...")
+            # Extraer matrices de vectores
+            img_vecs = np.vstack(results_df["image_vector"].to_list()).astype("float32")
+            txt_vecs = np.vstack(results_df["text_vector"].to_list()).astype("float32")
+            # Normalizar por seguridad (deberían venir normalizados)
+            def l2_normalize(x):
+                norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+                return x / norms
+            img_vecs = l2_normalize(img_vecs)
+            txt_vecs = l2_normalize(txt_vecs)
+            q = query_vector / (np.linalg.norm(query_vector) + 1e-12)
+            # Similaridades coseno
+            s1 = img_vecs @ q  # texto→imagen
+            s2 = txt_vecs @ q  # texto→caption
+            # Ponderación (ajustable)
+            score = 0.8 * s1 + 0.2 * s2
+            order = np.argsort(-score)
+            # Construir lista de candidatos ordenados
+            iterator = order
+            if tqdm is not None:
+                iterator = tqdm(order, desc="Re-rankeando", unit="item")
+            for idx in iterator:
+                row = results_df.iloc[int(idx)]
+                candidates.append({
+                    "imagen": row.get("imagen"),
+                    "caption": row.get("texto", ""),
+                    "score": float(score[int(idx)])
+                })
+        
         if not candidates:
             best_result = None
             image_caption = "No se encontró imagen relevante."
         else:
-            best_idx = self.re_rank_candidates(query_text, candidates)
+            # Re-ranking mejorado considerando el tipo de consulta
+            best_idx = self.enhanced_re_ranking(final_query, candidates, query_type)
             best_result = candidates[best_idx]
             image_caption = best_result["caption"]
-        model_response = self.qa_chain({"query": query_text})
+        
+        # Obtener contexto del manual usando la consulta original y procesada
+        model_response = self.qa_chain({"query": final_query})
         manual_context = model_response.get("result", "No se encontró contexto relevante.")
-        final_prompt = f"""
-You are a vehicle expert virtual assistant. Your responses must be extremely concise and structured.
-
-IMPORTANT GUIDELINES:
-1. Use bullet points or numbered lists
-2. Keep each point to 1-2 sentences maximum
-3. Focus only on essential information
-4. Avoid unnecessary explanations
-5. Be direct and actionable
-
-Image Description:
-{image_caption}
-
-Manual Extract:
-{manual_context}
-
-Query:
-{query_text}
-
-Provide a structured, concise response following the guidelines above.
-"""
-        response_generated = ChatOpenAI(openai_api_key=self.openai_api_key, temperature=0, model_name=self.llm_model)(final_prompt)
-        response_text = response_generated.content if hasattr(response_generated, 'content') else str(response_generated)
-        return best_result, response_text
-
-    def _preload_models(self):
-        """Precarga modelos para reducir latencia."""
-        self.processor = BridgeTowerProcessor.from_pretrained(
-            "BridgeTower/bridgetower-large-itm-mlm-itc",
-            cache_dir="./model_cache"
+        # Extraer posibles páginas de referencia desde las fuentes
+        reference_pages_list = []
+        try:
+            source_docs = model_response.get("source_documents", []) or []
+            pages_set = set()
+            for d in source_docs:
+                meta = getattr(d, "metadata", {}) or {}
+                page_val = meta.get("page") or meta.get("page_number") or meta.get("page_index")
+                if isinstance(page_val, int):
+                    pages_set.add(page_val)
+            if pages_set:
+                reference_pages_list = sorted(pages_set)
+        except Exception:
+            reference_pages_list = []
+        
+        # Generar respuesta final considerando el tipo de consulta
+        final_prompt = self.create_enhanced_prompt(
+            query_text, final_query, image_caption, manual_context, query_type, processed_result, reference_pages_list
         )
-        self.model_bridgetower = BridgeTowerForContrastiveLearning.from_pretrained(
-            "BridgeTower/bridgetower-large-itm-mlm-itc",
-            cache_dir="./model_cache"
-        ).to(self.device)
-        self.model_bridgetower.eval()
+        
+        response_generated = self.llm(final_prompt)
+        
+        response_text = response_generated.content if hasattr(response_generated, 'content') else str(response_generated)
+        
+        return best_result, response_text, processed_result
+
+    # Re-ranking avanzado (principal)
+    def enhanced_re_ranking(self, query, candidates, query_type):
+        """
+        Re-ranking mejorado que considera el tipo de consulta para mejor selección.
+        
+        Args:
+            query (str): Consulta procesada.
+            candidates (list): Lista de candidatos.
+            query_type (str): Tipo de consulta clasificada.
+        
+        Returns:
+            int: Índice del mejor candidato.
+        """
+        # Instrucciones específicas según el tipo de consulta
+        type_instructions = {
+            "diagnostic": "Prioriza resultados que muestren síntomas, problemas o fallas específicas.",
+            "maintenance": "Prioriza resultados sobre mantenimiento, cambios de partes o inspecciones.",
+            "procedure": "Prioriza resultados que muestren pasos, procedimientos o instrucciones.",
+            "specification": "Prioriza resultados con datos técnicos, especificaciones o medidas.",
+            "general": "Selecciona el resultado más relevante para la consulta general."
+        }
+        
+        instruction = type_instructions.get(query_type, type_instructions["general"])
+        
+        prompt = f'''Como experto automotriz, evalúa estos resultados para la consulta:
+"{query}"
+
+Tipo de consulta: {query_type}
+Instrucción específica: {instruction}
+
+Resultados disponibles:
+'''
+        
+        for i, cand in enumerate(candidates, start=1):
+            prompt += f"{i}. {cand['caption']}\n"
+        
+        prompt += f"\nConsiderando el tipo de consulta ({query_type}) y la instrucción específica, elige el número del resultado que mejor responde a la consulta. Responde solo con el número."
+        
+        response = ChatOpenAI(
+            openai_api_key=self.openai_api_key, 
+            temperature=0, 
+            model_name=self.llm_model
+        )(prompt)
+        
+        response_text = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+        match = re.search(r'\d+', response_text)
+        
+        if match:
+            try:
+                best_number = int(match.group())
+                if 1 <= best_number <= len(candidates):
+                    return best_number - 1
+            except Exception as e:
+                logger.error("Error al convertir la respuesta de re-ranking: %s", e)
+        
+        logger.warning("Respuesta inesperada en re-ranking mejorado: %s", response_text)
+        return 0
+
+    def create_enhanced_prompt(self, original_query, processed_query, image_caption, manual_context, query_type, processing_info, reference_pages_list):
+        """
+        Crea un prompt mejorado considerando el tipo de consulta y el procesamiento realizado.
+        
+        Args:
+            original_query (str): Consulta original del usuario.
+            processed_query (str): Consulta procesada.
+            image_caption (str): Descripción de la imagen.
+            manual_context (str): Contexto del manual.
+            query_type (str): Tipo de consulta.
+            processing_info (dict): Información del procesamiento.
+        
+        Returns:
+            str: Prompt optimizado para el LLM.
+        """
+        # Templates específicos según el tipo de consulta (respuestas naturales, sin viñetas ni encabezados)
+        type_templates = {
+            "diagnostic": """
+Información Visual: {image_caption}
+Contexto del Manual: {manual_context}
+Consulta: {original_query}
+
+Redacta una explicación breve (1–3 oraciones), directa y sin viñetas, indicando el diagnóstico probable y la(s) acción(es) inmediatas recomendadas. Menciona advertencias solo si aplican.
+""",
+            "maintenance": """
+Información Visual: {image_caption}
+Contexto del Manual: {manual_context}
+Consulta: {original_query}
+
+Responde en 1–3 oraciones, sin viñetas, indicando el componente, el procedimiento esencial y la frecuencia recomendada. Incluye precauciones solo si son críticas.
+""",
+            "procedure": """
+Información Visual: {image_caption}
+Contexto del Manual: {manual_context}
+Consulta: {original_query}
+
+Ofrece instrucciones claras en 1–3 oraciones, sin viñetas ni encabezados, priorizando los pasos clave y cómo verificar que quedó correcto.
+""",
+            "specification": """
+Información Visual: {image_caption}
+Contexto del Manual: {manual_context}
+Consulta: {original_query}
+
+Da el dato solicitado de forma precisa en 1–2 oraciones (valor exacto y tolerancias si aplican), sin viñetas.
+""",
+            "general": """
+Información Visual: {image_caption}
+Contexto del Manual: {manual_context}
+Consulta: {original_query}
+
+Responde de forma concisa en 1–3 oraciones, sin viñetas ni encabezados, enfocándote solo en lo más relevante a la pregunta.
+"""
+        }
+        
+        template = type_templates.get(query_type, type_templates["general"])
+        
+        rendered = template.format(
+            image_caption=image_caption,
+            manual_context=manual_context,
+            original_query=original_query
+        )
+
+        # Anexar sugerencia de consulta al manual con páginas si están disponibles
+        try:
+            pages_note = ""
+            if reference_pages_list:
+                pages_joined = ", ".join(str(p) for p in reference_pages_list)
+                pages_note = f" Para mayor detalle, consulte su manual vehicular (páginas {pages_joined})."
+            else:
+                pages_note = " Para mayor detalle, consulte su manual vehicular."
+            rendered = rendered.strip() + pages_note
+        except Exception:
+            rendered = rendered.strip() + " Para mayor detalle, consulte su manual vehicular."
+
+        return rendered
+
+    # Nota: Se eliminó la precarga duplicada; BridgeTower se inicializa una sola vez en _initialize_bridgetower
 
 ###############################################################################
 # MÓDULO: VoiceManager
@@ -315,9 +873,9 @@ class VoiceManager:
         self.voice_id = None
         self.eleven_client = ElevenLabs(api_key=self.eleven_api_key)
         self.voices = self.list_available_voices()
-        if self.voices and len(self.voices) > 26:
-            self.voice_id = self.voices[26]["voice_id"]
-            logger.info("Voz seleccionada: %s (ID: %s)", self.voices[26]["name"], self.voice_id)
+        if self.voices and len(self.voices) > 25:
+            self.voice_id = self.voices[25]["voice_id"]
+            logger.info("Voz seleccionada: %s (ID: %s)", self.voices[25]["name"], self.voice_id)
         else:
             logger.warning("No se encontraron voces disponibles. Verifique su API key de ElevenLabs.")
 
@@ -350,12 +908,39 @@ class VoiceManager:
             str: Texto transcrito.
         """
         try:
-            with open(audio_filepath, "rb") as audio_file:
+            # Validar actividad de voz antes de transcribir
+            with open(audio_filepath, "rb") as f:
+                audio_data = f.read()
+            
+            # Crear instancia del procesador de consultas para verificar voz
+            from pathlib import Path
+            temp_processor = QueryProcessor()
+            
+            # Verificar si hay voz en el audio
+            if not temp_processor.detect_voice_activity(audio_data):
+                logger.warning("No se detectó actividad de voz en el audio")
+                return ""
+            
+            # Mejorar calidad del audio antes de transcribir
+            improved_audio_path = temp_processor.improve_audio_quality(audio_filepath)
+            
+            # Transcribir usando el audio mejorado
+            with open(improved_audio_path, "rb") as audio_file:
                 transcription = openai.audio.transcriptions.create(
                     model="whisper-1",
-                    file=audio_file
+                    file=audio_file,
+                    language="es"  # Especificar idioma español para mejor precisión
                 )
+            
+            # Limpiar archivo temporal mejorado si es diferente del original
+            if improved_audio_path != audio_filepath and os.path.exists(improved_audio_path):
+                try:
+                    os.remove(improved_audio_path)
+                except:
+                    pass
+                    
             return transcription.text.strip()
+            
         except Exception as e:
             logger.error("Error en la transcripción: %s", e)
             return ""
@@ -589,11 +1174,45 @@ class VehicleAssistantUI:
         """
         try:
             query_text = self.voice_manager.transcribe_audio(audio_filepath)
+            
+            # Verificar si se obtuvo texto válido
+            if not query_text.strip():
+                self.append_history("Sistema: No se pudo transcribir el audio o no se detectó voz.")
+                return
+            
             self.append_history(f"Tú: {query_text}")
+            
+            # Verificar si está relacionado con vehículos
             is_vehicle_query = self.retrieval_manager.is_vehicle_related(query_text)
-            best_result, response_text = self.retrieval_manager.search_by_text(query_text)
+            
+            if not is_vehicle_query:
+                response_text = "Lo siento, solo puedo ayudarte con consultas relacionadas con vehículos y manuales automotrices. ¿Tienes alguna pregunta sobre tu automóvil?"
+                self.append_history(f"Asistente: {response_text}")
+                self.voice_manager.play_response_audio(response_text)
+                return
+            
+            # Procesar la consulta con todas las mejoras
+            best_result, response_text, processing_info = self.retrieval_manager.search_by_text(query_text)
+            
+            # Verificar si la consulta es ambigua y necesita clarificación
+            if processing_info.get("is_ambiguous", False):
+                clarification = processing_info.get("clarification_needed", "")
+                self.append_history(f"Asistente: {clarification}")
+                self.voice_manager.play_response_audio(clarification)
+                return
+            
+            # Mostrar información de procesamiento si es relevante
+            # Ocultar mensajes de procesamiento para una experiencia más limpia
+            
+            # Mostrar tipo de consulta detectado
+            query_type = processing_info.get("query_type", "general")
+            # Ocultar anuncio de clasificación de consulta en la UI
+            
+            # Mostrar respuesta
             self.append_history(f"Asistente: {response_text}")
-            if is_vehicle_query and best_result and best_result.get("imagen"):
+            
+            # Procesar y mostrar imagen si está disponible
+            if best_result and best_result.get("imagen"):
                 try:
                     image_bytes = best_result["imagen"]
                     image = Image.open(io.BytesIO(image_bytes))
@@ -608,19 +1227,34 @@ class VehicleAssistantUI:
             else:
                 self.image_label.config(image="")
                 self.image_label.image = None
+            
+            # Reproducir respuesta en audio
             self.voice_manager.play_response_audio(response_text)
+            
         except Exception as e:
-            self.append_history(f"Error: {e}")
+            error_message = f"Error procesando consulta: {str(e)}"
+            self.append_history(f"Error: {error_message}")
+            logger.error("Error en process_voice_query: %s", e)
+            
         finally:
+            # Restaurar estado del botón
             self.btn_listening.configure(text="Start\nListening")
             self.state = "waiting"
-            # Elimina el archivo de audio temporal
-            try:
-                if os.path.exists(audio_filepath):
-                    os.remove(audio_filepath)
-                    logger.info("Archivo de audio temporal eliminado.")
-            except Exception as cleanup_err:
-                logger.error("Error al eliminar archivo temporal: %s", cleanup_err)
+            
+            # Eliminar archivos temporales
+            temp_files = [audio_filepath]
+            # Agregar posibles archivos mejorados
+            improved_path = audio_filepath.replace('.wav', '_improved.wav')
+            if os.path.exists(improved_path):
+                temp_files.append(improved_path)
+                
+            for temp_file in temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                        logger.info(f"Archivo temporal eliminado: {temp_file}")
+                except Exception as cleanup_err:
+                    logger.error(f"Error al eliminar archivo temporal {temp_file}: {cleanup_err}")
 
     def toggle_listening(self):
         """
