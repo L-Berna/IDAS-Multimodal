@@ -1,0 +1,83 @@
+# MM-IDAS Environment Variables Setup
+# Instructions for setting up API keys
+
+## Required API Keys
+
+### 1. OpenAI API Key (Required)
+# For Whisper transcription and GPT models
+# Get it from: https://platform.openai.com/api-keys
+
+export OPENAI_API_KEY="sk-your-openai-api-key-here"
+
+### 2. ElevenLabs API Key (Required)
+# For text-to-speech
+# Get it from: https://elevenlabs.io/app/settings/api-keys
+
+export ELEVEN_LABS_KEY="your-elevenlabs-api-key-here"
+
+
+## Optional API Keys (only if using these LLM providers)
+
+### 3. Anthropic API Key (Optional)
+# Only needed if using Claude models
+# Get it from: https://console.anthropic.com/settings/keys
+
+export ANTHROPIC_API_KEY="your-anthropic-api-key-here"
+
+### 4. Mistral API Key (Optional)
+# Only needed if using Mistral models
+# Get it from: https://console.mistral.ai/api-keys/
+
+export MISTRAL_API_KEY="your-mistral-api-key-here"
+
+### 5. Llama API Key (Optional)
+# Only needed if using Llama models via API
+# Get it from: https://www.llama-api.com/
+
+export LLAMA_API_KEY="your-llama-api-key-here"
+
+
+## How to Set Environment Variables
+
+### Linux/Mac (bash/zsh):
+# Add to ~/.bashrc or ~/.zshrc:
+export OPENAI_API_KEY="your-key-here"
+export ELEVEN_LABS_KEY="your-key-here"
+
+# Then reload:
+source ~/.bashrc
+
+### Windows (PowerShell):
+# Temporary (current session only):
+$env:OPENAI_API_KEY="your-key-here"
+$env:ELEVEN_LABS_KEY="your-key-here"
+
+# Permanent (system-wide):
+[System.Environment]::SetEnvironmentVariable('OPENAI_API_KEY', 'your-key-here', 'User')
+[System.Environment]::SetEnvironmentVariable('ELEVEN_LABS_KEY', 'your-key-here', 'User')
+
+### Windows (Command Prompt):
+# Temporary:
+set OPENAI_API_KEY=your-key-here
+set ELEVEN_LABS_KEY=your-key-here
+
+# Permanent:
+setx OPENAI_API_KEY "your-key-here"
+setx ELEVEN_LABS_KEY "your-key-here"
+
+
+## Alternative: Using .env file (with python-dotenv)
+
+# Create a .env file in the demo directory with:
+OPENAI_API_KEY=sk-your-openai-api-key-here
+ELEVEN_LABS_KEY=your-elevenlabs-api-key-here
+
+# Then in your code:
+from dotenv import load_dotenv
+load_dotenv()
+
+## Security Notes
+# - Never commit API keys to version control
+# - Keep your .env file in .gitignore
+# - Rotate keys if accidentally exposed
+# - Use environment variables for production deployments

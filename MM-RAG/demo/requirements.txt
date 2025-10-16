@@ -1,0 +1,44 @@
+# MM-IDAS Requirements
+# Multimodal Intelligent Driving Assistance System
+
+# Core ML/DL
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Vector Database
+lancedb>=0.3.0
+
+# LangChain and LLMs
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
+langchain-core>=0.1.0
+langchain-anthropic>=0.1.0
+langchain-mistralai>=0.0.1
+
+# OpenAI (Whisper, GPT)
+openai>=1.0.0
+
+# Text-to-Speech
+elevenlabs>=0.2.0
+
+# Audio Processing
+pyaudio>=0.2.13
+
+# GUI
+# tkinter (comes with Python, no need to install)
+
+# Utilities
+colorama>=0.4.6
+python-dotenv>=1.0.0
+
+# Optional: For better performance
+# faiss-cpu>=1.7.4  # CPU version
+# faiss-gpu>=1.7.4  # GPU version (requires CUDA)
+
+# Development (optional)
+# matplotlib>=3.7.0  # For testing and visualization
+# jupyter>=1.0.0     # If using notebooks
